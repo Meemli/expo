@@ -18,6 +18,7 @@ import {
   serverPreludeSerializerPlugin,
 } from './environmentVariableSerializerPlugin';
 import { event } from './events';
+import { findUnsupportedWorkerAsyncDependency } from './findUnsupportedWorkerAsyncDependency';
 import type { ExpoSerializerOptions } from './fork/baseJSBundle';
 import { getSortedModules, graphToSerialAssetsAsync } from './serializeChunks';
 import type { ChunkingStrategy } from './serializerAssets';
@@ -357,7 +358,7 @@ function getDefaultSerializer(
 
     const customTransformOptions = graph.transformOptions.customTransformOptions;
     const isLazyBundle = options.includeAsyncPaths;
-    const useBitSet =
+    const isBitSetEligible =
       customSerializerOptions?.chunkingStrategy === 'bitset' &&
       customSerializerOptions.exporting &&
       serializerOptions.splitChunks &&
@@ -366,7 +367,10 @@ function getDefaultSerializer(
       customTransformOptions?.dom == null &&
       !options.dev &&
       !isLazyBundle;
-    const chunkingStrategy: ChunkingStrategy = useBitSet ? 'bitset' : 'legacy';
+    const chunkingStrategy: ChunkingStrategy =
+      isBitSetEligible && !findUnsupportedWorkerAsyncDependency(entryPoint, graph)
+        ? 'bitset'
+        : 'legacy';
 
     const assets = await graphToSerialAssetsAsync(
       config,
