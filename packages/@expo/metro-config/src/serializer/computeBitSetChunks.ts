@@ -6,6 +6,10 @@ import type { AsyncDependencyType } from '../transform-worker/collect-dependenci
 export type BitSet = bigint;
 type GraphModule = Module<MixedOutput>;
 
+function validateBits(bits: BitSet): void {
+  if (bits < 0n) throw new Error('BitSet operations require a non-negative value.');
+}
+
 function validateIndex(index: number): void {
   if (!Number.isSafeInteger(index) || index < 0) {
     throw new Error('BitSet indices and counts must be a non-negative safe integer.');
@@ -13,16 +17,19 @@ function validateIndex(index: number): void {
 }
 
 export function addBit(bits: BitSet, index: number): BitSet {
+  validateBits(bits);
   validateIndex(index);
   return bits | (1n << BigInt(index));
 }
 
 export function removeBit(bits: BitSet, index: number): BitSet {
+  validateBits(bits);
   validateIndex(index);
   return bits & ~(1n << BigInt(index));
 }
 
 export function hasBit(bits: BitSet, index: number): boolean {
+  validateBits(bits);
   validateIndex(index);
   return (bits & (1n << BigInt(index))) !== 0n;
 }
@@ -33,7 +40,7 @@ export function allBits(count: number): BitSet {
 }
 
 export function* bitIndices(bits: BitSet): IterableIterator<number> {
-  if (bits < 0n) throw new Error('BitSet iteration requires a non-negative value.');
+  validateBits(bits);
   for (let index = 0; bits !== 0n; index++, bits >>= 1n) {
     if ((bits & 1n) !== 0n) yield index;
   }
@@ -49,6 +56,139 @@ export interface BitSetGraphAnalysis {
   readonly dependentEntriesByModule: ReadonlyMap<GraphModule, BitSet>;
   readonly importerEntriesByDynamicEntry: readonly BitSet[];
   readonly dynamicImportsByEntry: readonly BitSet[];
+}
+
+/** An ownership group, not yet an emitted file or semantic entry facade. */
+export interface ChunkAtom {
+  readonly dependentEntries: BitSet;
+  readonly modules: ReadonlySet<GraphModule>;
+}
+
+export interface BitSetChunkPlan extends BitSetGraphAnalysis {
+  readonly rawAtoms: readonly ChunkAtom[];
+  /** These masks index rawAtoms, not entrypoints or normalized chunks. */
+  readonly staticAtoms: readonly BitSet[];
+  readonly alreadyLoadedAtoms: readonly BitSet[];
+  readonly chunks: readonly ChunkAtom[];
+  readonly chunkByModule: ReadonlyMap<GraphModule, ChunkAtom>;
+  /** Full physical ownership requirements, before facades or caller-specific omissions. */
+  readonly requiredChunksByEntryPath: ReadonlyMap<string, readonly ChunkAtom[]>;
+}
+
+function groupModulesByOwners(ownersByModule: ReadonlyMap<GraphModule, BitSet>): ChunkAtom[] {
+  const modulesByOwners = new Map<BitSet, GraphModule[]>();
+  for (const [module, bits] of ownersByModule) {
+    let modules = modulesByOwners.get(bits);
+    if (!modules) {
+      modules = [];
+      modulesByOwners.set(bits, modules);
+    }
+    modules.push(module);
+  }
+  return [...modulesByOwners]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([dependentEntries, modules]) => ({
+      dependentEntries,
+      modules: new Set(modules.sort(compareModules)),
+    }));
+}
+
+/** Plan ownership without constructing legacy Chunk objects or serializing code. */
+export function computeBitSetChunkPlan(
+  initialEntries: readonly GraphModule[],
+  graph: ReadOnlyGraph,
+  options: { isLazyBundle: boolean }
+): BitSetChunkPlan {
+  const analysis = analyzeBitSetGraph(initialEntries, graph, options);
+  const {
+    entryPoints,
+    dependentEntriesByModule,
+    importerEntriesByDynamicEntry,
+    dynamicImportsByEntry,
+  } = analysis;
+  const rawAtoms = groupModulesByOwners(dependentEntriesByModule);
+  const staticAtoms = entryPoints.map(() => 0n);
+  for (const [atomIndex, atom] of rawAtoms.entries()) {
+    const atomMask = 1n << BigInt(atomIndex);
+    for (const entryIndex of bitIndices(atom.dependentEntries)) {
+      staticAtoms[entryIndex] = staticAtoms[entryIndex]! | atomMask;
+    }
+  }
+
+  const allAtoms = allBits(rawAtoms.length);
+  const alreadyLoadedAtoms = entryPoints.map((entry) => (entry.kind === 'initial' ? 0n : allAtoms));
+  const pendingEntries = new Set<number>();
+  for (const [index, entry] of entryPoints.entries()) {
+    if (entry.kind === 'initial') continue;
+    // Root-based discovery guarantees a finite importer path from an initial entry.
+    // Merely having an importer is not enough: a disconnected cycle has importers too.
+    if (importerEntriesByDynamicEntry[index] === 0n) {
+      throw new Error(
+        `BitSet dynamic entry ${entry.module.path} has no importer. Check root-based entry discovery.`
+      );
+    }
+    pendingEntries.add(index);
+  }
+  // Deleting before visiting descendants lets a later change enqueue this entry again.
+  // Availability only shrinks, including across dynamic cycles.
+  for (const entryIndex of pendingEntries) {
+    pendingEntries.delete(entryIndex);
+    let updatedLoadedAtoms = allAtoms;
+    for (const importerIndex of bitIndices(importerEntriesByDynamicEntry[entryIndex]!)) {
+      updatedLoadedAtoms &= staticAtoms[importerIndex]! | alreadyLoadedAtoms[importerIndex]!;
+    }
+    if (updatedLoadedAtoms === alreadyLoadedAtoms[entryIndex]) continue;
+    alreadyLoadedAtoms[entryIndex] = updatedLoadedAtoms;
+    for (const descendantIndex of bitIndices(dynamicImportsByEntry[entryIndex]!))
+      pendingEntries.add(descendantIndex);
+  }
+
+  const normalizedOwnersByModule = new Map<GraphModule, BitSet>();
+  const rawOwnersByNormalizedOwners = new Map<BitSet, BitSet>();
+  for (const [atomIndex, atom] of rawAtoms.entries()) {
+    let owners = atom.dependentEntries;
+    for (const entryIndex of bitIndices(owners)) {
+      if (hasBit(alreadyLoadedAtoms[entryIndex]!, atomIndex))
+        owners = removeBit(owners, entryIndex);
+    }
+    // The first owner on an initial-root importer path survives: its predecessor
+    // neither owns this atom nor already has it. Initial availability is always 0.
+    // This does NOT imply that the initial entry must statically own the atom.
+    if (owners === 0n) {
+      throw new Error(
+        `BitSet atom containing ${[...atom.modules][0]!.path} lost every owner. ` +
+          'Check initial-root reachability and complete dynamic importer tracking.'
+      );
+    }
+    for (const module of atom.modules) normalizedOwnersByModule.set(module, owners);
+    rawOwnersByNormalizedOwners.set(
+      owners,
+      (rawOwnersByNormalizedOwners.get(owners) ?? 0n) | atom.dependentEntries
+    );
+  }
+
+  const chunks = groupModulesByOwners(normalizedOwnersByModule);
+  const chunkByModule = new Map<GraphModule, ChunkAtom>();
+  const requiredChunksByEntry = entryPoints.map(() => [] as ChunkAtom[]);
+  for (const chunk of chunks) {
+    for (const module of chunk.modules) {
+      chunkByModule.set(module, chunk);
+    }
+    for (const entryIndex of bitIndices(rawOwnersByNormalizedOwners.get(chunk.dependentEntries)!)) {
+      requiredChunksByEntry[entryIndex]!.push(chunk);
+    }
+  }
+  return {
+    ...analysis,
+    rawAtoms,
+    staticAtoms,
+    alreadyLoadedAtoms,
+    chunks,
+    chunkByModule,
+    requiredChunksByEntryPath: new Map(
+      entryPoints.map((entry, index) => [entry.module.path, requiredChunksByEntry[index]!])
+    ),
+  };
 }
 
 function compareModules(a: GraphModule, b: GraphModule): number {
