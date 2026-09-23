@@ -10,15 +10,17 @@ import type { MixedOutput, Module, ReadOnlyGraph } from '@expo/metro/metro/Delta
 import bundleToString from '@expo/metro/metro/lib/bundleToString';
 import { isResolvedDependency } from '@expo/metro/metro/lib/isResolvedDependency';
 import assert from 'assert';
+import { createHash } from 'crypto';
 import path from 'path';
 
 import type { AsyncDependencyType } from '../transform-worker/collect-dependencies';
 import getMetroAssets from '../transform-worker/getAssets';
 import type { ExpoCustomTransformOptions } from '../transform-worker/types';
 import { toPosixPath } from '../utils/filePath';
+import { bitIndices, computeBitSetChunkPlan, type ChunkAtom } from './computeBitSetChunks';
 import { precomputeChunkFilenames } from './computeChunkFilenames';
 import { stringToUUID } from './debugId';
-import { getExportPathForDependencyWithOptions } from './exportPath';
+import { getChunkUrl, getExportPathForDependencyWithOptions } from './exportPath';
 import type { ExpoSerializerOptions } from './fork/baseJSBundle';
 import { getCssSerialAssets } from './getCssDeps';
 import type { ChunkingStrategy, SerialAsset } from './serializerAssets';
@@ -78,8 +80,159 @@ export type SerializeChunkOptions = {
 
 type ChunkOptions = ExpoSerializerOptions & {
   chunkingStrategy?: ChunkingStrategy;
-  isLazyBundle: boolean;
 };
+
+/** Materialize the pure plan without activating the public serializer strategy. */
+export async function serializeBitSetChunksAsync(
+  serializerConfig: Partial<SerializerConfigT>,
+  serializeChunkOptions: SerializeChunkOptions,
+  entryFile: string,
+  preModules: readonly Module[],
+  graph: ReadOnlyGraph,
+  metroOptions: ExpoSerializerOptions
+): Promise<SerialAsset[]> {
+  const options: ChunkOptions = {
+    ...metroOptions,
+    chunkingStrategy: 'bitset',
+  };
+  const entryModule = graph.dependencies.get(entryFile);
+  assert(entryModule, `BitSet entry is missing from the export graph: ${entryFile}`);
+  const plan = computeBitSetChunkPlan([entryModule], graph, {
+    isLazyBundle: options.includeAsyncPaths,
+  });
+  const chunks = new Set<Chunk>();
+  const facadesByEntryPath = new Map<string, Chunk>();
+  for (const { module, kind } of plan.entryPoints) {
+    const facade = new Chunk(
+      module.path,
+      new Set([module]),
+      graph,
+      options,
+      kind !== 'initial',
+      false,
+      kind === 'initial'
+    );
+    facade.deps.clear();
+    facade.entryPaths = [module.path];
+    facadesByEntryPath.set(module.path, facade);
+    chunks.add(facade);
+  }
+  const entryChunk = facadesByEntryPath.get(entryFile)!;
+  entryChunk.preModules = new Set(preModules);
+  const chunksByAtom = new Map<ChunkAtom, Chunk>();
+  for (const atom of plan.chunks) {
+    const entryIndices = [...bitIndices(atom.dependentEntries)];
+    let ownerChunk: Chunk;
+    if (entryIndices.length === 1) {
+      ownerChunk = facadesByEntryPath.get(plan.entryPoints[entryIndices[0]!]!.module.path)!;
+    } else {
+      const ownerPaths = entryIndices
+        .map((index) =>
+          toPosixPath(
+            path.relative(
+              options.serverRoot ?? options.projectRoot,
+              plan.entryPoints[index]!.module.path
+            )
+          )
+        )
+        .sort();
+      const hash = createHash('sha256')
+        .update(JSON.stringify(ownerPaths))
+        .digest('hex')
+        .slice(0, 16);
+      ownerChunk = new Chunk(`/__shared-${hash}.js`, new Set(), graph, options, true);
+      chunks.add(ownerChunk);
+    }
+    ownerChunk.deps = new Set(atom.modules);
+    chunksByAtom.set(atom, ownerChunk);
+  }
+  const requiredChunksByEntryPath = new Map<string, readonly Chunk[]>();
+  for (const [entryPath, atoms] of plan.requiredChunksByEntryPath) {
+    const facade = facadesByEntryPath.get(entryPath)!;
+    const requiredChunks = new Set(atoms.map((atom) => chunksByAtom.get(atom)!));
+    if (facade !== entryChunk && [...requiredChunks].every((chunk) => chunk === entryChunk)) {
+      chunks.delete(facade);
+      entryChunk.entryPaths.push(entryPath);
+      requiredChunksByEntryPath.set(entryPath, []);
+      continue;
+    }
+    for (const ownerChunk of requiredChunks) {
+      if (ownerChunk !== entryChunk && ownerChunk !== facade) facade.requiredChunks.add(ownerChunk);
+    }
+    requiredChunksByEntryPath.set(
+      entryPath,
+      [facade, ...requiredChunks].filter(
+        (chunk, index, all) => chunk !== entryChunk && all.indexOf(chunk) === index
+      )
+    );
+  }
+
+  // Use the existing sealed closure collector, never its page assignment/dedup passes.
+  const workerChunks = new Set<Chunk>();
+  for (const module of plan.workerEntries) {
+    for (const chunk of gatherChunks(
+      preModules,
+      workerChunks,
+      { test: pathToRegex(module.path) },
+      preModules,
+      graph,
+      options,
+      true,
+      true
+    )) {
+      chunk.seal();
+    }
+  }
+  const workerChunksByEntryPath = new Map<string, Chunk>();
+  for (const workerChunk of workerChunks) {
+    assert(
+      workerChunk.sealed,
+      'Worker async edges must fall back to legacy before BitSet planning.'
+    );
+    for (const module of workerChunk.entries) workerChunksByEntryPath.set(module.path, workerChunk);
+    chunks.add(workerChunk);
+  }
+  if ([...chunks].some((chunk) => chunk.isAsync && !chunk.sealed)) {
+    createRuntimeChunk(entryChunk, chunks, graph, options);
+  }
+  for (const chunk of chunks) {
+    chunk.getBitSetChunkTargets = (dependency) => {
+      const asyncType = dependency.data.data.asyncType as AsyncDependencyType | null;
+      if (asyncType == null || asyncType === 'weak') return [];
+      if (asyncType === 'worker') {
+        const workerChunk = workerChunksByEntryPath.get(dependency.absolutePath);
+        assert(workerChunk, `Worker chunk not found for: ${dependency.absolutePath}`);
+        return [workerChunk];
+      }
+      const targets = requiredChunksByEntryPath.get(dependency.absolutePath);
+      assert(targets, `BitSet async entry not found: ${dependency.absolutePath}`);
+      return targets.filter((target) => target !== chunk);
+    };
+  }
+  const orderedChunks = new Set([
+    entryChunk,
+    ...[...chunks]
+      .filter((chunk) => chunk !== entryChunk)
+      .sort((a, b) => a.name.localeCompare(b.name, 'en')),
+  ]);
+  // Use the context-wrapped factory supplied by the serializer. Existing assignments stay intact.
+  const modulePaths = new Set<string>();
+  for (const chunk of orderedChunks) {
+    for (const module of [...chunk.preModules, ...chunk.deps]) {
+      modulePaths.add(module.path);
+      for (const dependency of module.dependencies.values()) {
+        if (isResolvedDependency(dependency)) modulePaths.add(dependency.absolutePath);
+      }
+    }
+  }
+  for (const modulePath of [...modulePaths].sort()) options.createModuleId(modulePath);
+  return serializeChunksAsync(
+    orderedChunks,
+    serializerConfig,
+    serializeChunkOptions,
+    !!options.serializerOptions?.exporting
+  );
+}
 
 export async function graphToSerialAssetsAsync(
   config: MetroConfig,
@@ -89,9 +242,7 @@ export async function graphToSerialAssetsAsync(
   artifacts: SerialAsset[] | null;
   assets: AssetData[];
 }> {
-  const [entryFile, preModules, graph, metroOptions] = props;
-  // Capture the incoming graph mode before any serialization pass enables paths.
-  const options: ChunkOptions = { ...metroOptions, isLazyBundle: metroOptions.includeAsyncPaths };
+  const [entryFile, preModules, graph, options] = props;
 
   const cssDeps = getCssSerialAssets<MixedOutput>(graph.dependencies, {
     entryFile,
@@ -176,6 +327,10 @@ export async function graphToSerialAssetsAsync(
 }
 
 export class Chunk {
+  public entryPaths: string[] = [];
+  public getBitSetChunkTargets?: (
+    dependency: import('@expo/metro/metro/DeltaBundler/types').ResolvedDependency
+  ) => readonly Chunk[];
   public deps: Set<Module> = new Set();
   public preModules: Set<Module> = new Set();
 
@@ -267,6 +422,10 @@ export class Chunk {
       splitChunks: !!this.options.serializerOptions?.splitChunks,
       skipWrapping: true,
       computedAsyncModulePaths: null,
+      ...(this.options.chunkingStrategy === 'bitset' && {
+        includeAsyncPaths: false,
+        unstable_getAsyncDependencyPath: undefined,
+      }),
       ...options,
     });
 
@@ -290,12 +449,16 @@ export class Chunk {
     }
     const targets = new Set<Chunk>();
     this._asyncTargets = targets;
-    if (this.options.isLazyBundle) {
+    if (this.options.includeAsyncPaths) {
       return targets;
     }
     for (const module of this.deps) {
       for (const dep of module.dependencies.values()) {
         if (isResolvedDependency(dep) && dep.data.data.asyncType) {
+          if (this.getBitSetChunkTargets) {
+            for (const target of this.getBitSetChunkTargets(dep)) targets.add(target);
+            continue;
+          }
           const target = chunkByPath.get(dep.absolutePath);
           // NOTE(kitten): Chunk merges can leave async imports pointing at non-async
           // (entry/vendor) chunks; those are loaded eagerly so we skip them here.
@@ -312,7 +475,7 @@ export class Chunk {
   ) {
     const baseUrl = getBaseUrlOption(this.graph, this.options);
     // Only calculate production paths when all chunks are being exported.
-    if (this.options.isLazyBundle) {
+    if (this.options.includeAsyncPaths) {
       return null;
     }
     const computedAsyncModulePaths: Record<string, string> = {};
@@ -412,12 +575,27 @@ export class Chunk {
     return this.serializeToCodeWithTemplates(serializerConfig, {
       skipWrapping: false,
       sourceMapUrl: this.getAdjustedSourceMapUrl(filename) ?? undefined,
-      computedAsyncModulePaths: this.getComputedPathsForAsyncDependencies(
-        chunksByPath,
-        filenamesByChunk
-      ),
+      computedAsyncModulePaths: this.getBitSetChunkTargets
+        ? null
+        : this.getComputedPathsForAsyncDependencies(chunksByPath, filenamesByChunk),
       debugId,
       preModules,
+      ...(this.getBitSetChunkTargets && {
+        includeAsyncPaths: true,
+        unstable_getAsyncDependencyPath: (dependency) => {
+          const targets = this.getBitSetChunkTargets!(dependency);
+          const chunkUrls = targets.map((target) => {
+            const filename = filenamesByChunk.get(target);
+            assert(filename, `Precomputed filename missing for chunk: ${target.name}`);
+            return getChunkUrl(getBaseUrlOption(this.graph, this.options), filename);
+          });
+          return (dependency.data.data.asyncType as AsyncDependencyType) === 'worker'
+            ? (chunkUrls[0] ?? null)
+            : chunkUrls.length
+              ? chunkUrls
+              : null;
+        },
+      }),
     });
   }
 
@@ -463,6 +641,10 @@ export class Chunk {
       originFilename: relativeEntry,
       type: 'js',
       metadata: {
+        ...(this.options.chunkingStrategy === 'bitset' && {
+          chunkingStrategy: 'bitset' as const,
+          entryPaths: [...this.entryPaths].sort(),
+        }),
         isAsync: this.isAsync,
         requires: [...this.requiredChunks.values()].map((chunk) => {
           const filename = filenamesByChunk.get(chunk);
@@ -471,7 +653,10 @@ export class Chunk {
         }),
         // Provide a list of module paths that can be used for matching chunks to routes.
         // TODO: Move HTML serializing closer to this code so we can reduce passing this much data around.
-        modulePaths: [...this.deps].map((module) => module.path),
+        modulePaths:
+          this.options.chunkingStrategy === 'bitset' && !this.sealed
+            ? [...this.deps].map((module) => module.path).sort()
+            : [...this.deps].map((module) => module.path),
         paths: jsCode.paths,
         expoDomComponentReferences: collectOutputReferences(this.deps, 'expoDomComponentReference'),
         reactClientReferences: collectOutputReferences(this.deps, 'reactClientReference'),
@@ -741,7 +926,7 @@ function gatherChunks(
         // Workers require standalone bundles even when ordinary chunk splitting is disabled.
         (isWorker || splitChunks)
       ) {
-        if (isWorker && options.isLazyBundle) {
+        if (isWorker && options.includeAsyncPaths) {
           continue;
         }
         const asyncChunks = gatherChunks(
@@ -875,6 +1060,7 @@ function createRuntimeChunk(
 
   for (const chunk of chunks) {
     // Runtime chunk has to load before any other a.k.a all chunks require it.
+    if (options.chunkingStrategy === 'bitset' && chunk.sealed) continue;
     chunk.requiredChunks.add(runtimeChunk);
   }
   chunks.add(runtimeChunk);
@@ -929,6 +1115,17 @@ async function serializeChunksAsync(
     serializerConfig,
     recomputeChunkNames,
   });
+
+  if ([...chunks].some((chunk) => chunk.options.chunkingStrategy === 'bitset')) {
+    // Preserve the planner's initial-first order, regardless of serialization completion.
+    return (
+      await Promise.all(
+        [...chunks].map((chunk) =>
+          chunk.serializeToAssetsAsync(serializerConfig, chunksByPath, filenamesByChunk, options)
+        )
+      )
+    ).flat();
+  }
 
   const serializeTasks: Promise<unknown>[] = [];
   for (const chunk of chunks) {
