@@ -8,6 +8,8 @@
 
 ### 🐛 Bug fixes
 
+- [iOS] Build the embedded manifest's assets in dev mode for any configuration containing `Debug`, matching the JS bundle. ([#49452](https://github.com/expo/expo/pull/49452) by [@ramonclaudio](https://github.com/ramonclaudio))
+
 ### 💡 Others
 
 ## 58.0.8 — 2026-09-23
