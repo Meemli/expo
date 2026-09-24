@@ -71,4 +71,23 @@ describe(createManifestForBuildAsync, () => {
       [4, 'hash-4x'],
     ]);
   });
+
+  it.each([
+    { configuration: 'DebugStaging', dev: true },
+    { configuration: 'Release', dev: false },
+    { configuration: undefined, dev: false },
+  ])('uses Metro dev=$dev for configuration $configuration', async ({ configuration, dev }) => {
+    const originalEnv = process.env;
+    process.env = { ...originalEnv, CONFIGURATION: configuration };
+    try {
+      await createManifestAsync('ios');
+    } finally {
+      process.env = originalEnv;
+    }
+
+    expect(createMetroServerAndBundleRequestAsync).toHaveBeenLastCalledWith(
+      projectRoot,
+      expect.objectContaining({ dev })
+    );
+  });
 });
