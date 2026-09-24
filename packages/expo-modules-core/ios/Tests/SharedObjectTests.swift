@@ -147,6 +147,27 @@ struct SharedObjectTests {
     #expect(appContext.sharedObjectRegistry.size == registrySizeBefore)
   }
 
+  @Test
+  func `releases the native object after removing a listener when stopObserving throws`() throws {
+    let registrySizeBefore = appContext.sharedObjectRegistry.size
+    try runtime.eval(
+      """
+      (() => {
+        const sharedObject = new expo.modules.SharedObjectModule.SharedObjectExample();
+        sharedObject.stopObserving = () => {
+          throw new Error('stopObserving failed');
+        };
+        const subscription = sharedObject.addListener('test event', () => sharedObject);
+        try {
+          subscription.remove();
+        } catch {}
+      })()
+      """
+    )
+    try runtime.collectGarbage { appContext.sharedObjectRegistry.size == registrySizeBefore }
+    #expect(appContext.sharedObjectRegistry.size == registrySizeBefore)
+  }
+
   // MARK: - Native object
 
   @Test

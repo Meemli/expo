@@ -192,16 +192,16 @@ jsi::Value createEventSubscription(jsi::Runtime &runtime, const std::string &eve
       // The subscription has already been removed.
       return jsi::Value::undefined();
     }
-    jsi::Object emitter = emitterValue->getObject(runtime);
-    jsi::Function listener = listenerValue->getObject(runtime).getFunction(runtime);
-
-    removeListener(runtime, emitter, eventName, listener);
-
     // Values held by this host function are GC roots. The listener's closure often references the subscription
     // (e.g. a React effect returning `() => subscription.remove()`), so keeping them after the removal would form
     // a cycle through a root that the garbage collector can never break, leaking the listener and the emitter.
-    *emitterValue = jsi::Value::undefined();
-    *listenerValue = jsi::Value::undefined();
+    // Move them out before removing the listener, as the observing functions it calls may throw or call `remove()` again.
+    jsi::Value emitterValueLocal = std::move(*emitterValue);
+    jsi::Value listenerValueLocal = std::move(*listenerValue);
+    jsi::Object emitter = emitterValueLocal.getObject(runtime);
+    jsi::Function listener = listenerValueLocal.getObject(runtime).getFunction(runtime);
+
+    removeListener(runtime, emitter, eventName, listener);
     return jsi::Value::undefined();
   };
 
