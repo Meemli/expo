@@ -8,6 +8,8 @@
 
 ### 🐛 Bug fixes
 
+- Resolve Expo Updates runtime versions for the dev server in development mode. ([#49508](https://github.com/expo/expo/pull/49508) by [@ramonclaudio](https://github.com/ramonclaudio))
+
 ### 💡 Others
 
 ## 58.0.6 — 2026-09-23
